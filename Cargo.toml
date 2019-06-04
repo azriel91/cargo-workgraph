@@ -1,0 +1,11 @@
+[package]
+name = "cargo-workgraph"
+version = "0.1.0"
+authors = ["Azriel Hoh <azriel91@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+log = "0.4.6"
+cargo_toml = "0.6.4"
+derivative = "1.0.2"
+# daggy = "0.6.0"
