@@ -1,22 +1,7 @@
-use std::{cell::Cell, collections::HashMap, fs, io, path::Path};
+use std::{cell::Cell, collections::HashSet, fs, io, path::Path};
 
 use cargo_toml::Manifest;
 use derivative::Derivative;
-// use daggy::{Dag, NodeIndex, WouldCycle};
-
-// 1. Read each `crate_type` into a list, where type is regular / dev.
-// 2. For all `crate_type`s:
-//
-//     ```rust
-//     if !links.contains(crate_type) {
-//         let deps = read_manifest_deps();
-//         links.insert(crate_type, deps);
-//     }
-//     ```
-//
-// 3. Print out graph.
-//
-// We don't care about version, because this is only what's in the current workspace.
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum DependencyType {
@@ -53,6 +38,9 @@ pub struct Node {
     pub name: String,
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
+    pub dependencies: Vec<Dependency>,
+    #[derivative(Hash = "ignore")]
+    #[derivative(PartialEq = "ignore")]
     pub state: Cell<State>,
 }
 
@@ -65,6 +53,10 @@ impl Node {
         self.state.get() == State::Processed
     }
 }
+
+/// A cycle is a chain of crates that end up in a dependency circle
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct Cycle(pub Vec<Node>);
 
 fn read_crates<P>(dir: P) -> io::Result<Vec<CrateMetadata>>
 where
@@ -103,16 +95,16 @@ where
     Ok(crate_metadatas)
 }
 
-fn calculate_links(all_crates: Vec<CrateMetadata>) -> HashMap<Node, Vec<Dependency>> {
+fn build_nodes(all_crates: Vec<CrateMetadata>) -> Vec<Node> {
+    let crate_names = all_crates
+        .iter()
+        .map(|crate_metadata| crate_metadata.name.clone())
+        .collect::<Vec<String>>();
+
     all_crates
         .into_iter()
         .map(|crate_metadata| {
             let CrateMetadata { name, manifest } = crate_metadata;
-
-            let node = Node {
-                name,
-                state: Cell::new(State::NotProcessed),
-            };
 
             let dependencies_regular = manifest.dependencies;
             let dependencies_regular =
@@ -131,23 +123,94 @@ fn calculate_links(all_crates: Vec<CrateMetadata>) -> HashMap<Node, Vec<Dependen
 
             let dependencies = dependencies_regular
                 .chain(dependencies_dev)
+                .filter(|dep| crate_names.iter().any(|name| name == &dep.name))
                 .collect::<Vec<Dependency>>();
 
-            (node, dependencies)
+            Node {
+                name,
+                dependencies,
+                state: Cell::new(State::NotProcessed),
+            }
         })
-        .collect::<HashMap<Node, Vec<Dependency>>>()
+        .collect::<Vec<Node>>()
 }
 
-fn _print_graph<'l>(links: &'l HashMap<Node, Vec<Dependency>>) {
-    // While not all links have been visited, attach them to the tree.
-    //
-    // Build a graph. Start at a node:
-    //
-    // 1. Remove the node from links / mark it as seen.
-    // 2. For each of its deps.
-    //
-    //     1. Print the child relationship to the current node.
+fn detect_cycles_all<'l>(nodes: &'l Vec<Node>) -> HashSet<Cycle> {
+    // Clone while no nodes are marked processed.
+    nodes
+        .iter()
+        .flat_map(|node| detect_cycle(&nodes.clone(), &mut Vec::new(), node))
+        .collect::<HashSet<Cycle>>()
+}
 
+// fn detect_cycles<'node>(nodes: Vec<Node>, first_node: &'node Node) -> HashSet<Cycle> {
+//     let mut cycle_buffer = Vec::new();
+//     let mut target_node = nodes.iter().find(|node| node == first_node);
+
+//     while let Some(node) = target_node {
+//         if !node.is_processed() {
+//             node.mark_processed();
+
+//             node.dependencies.iter()
+
+//             target_node = nodes.iter().find(|node| node == first_node);
+
+//             cycle_buffer.push(node.clone());
+//         } else {
+
+//             return Some(cycle);
+//         }
+//     }
+
+//     // If we reached here, just drop the cycle buffer.
+//     None
+// }
+
+fn detect_cycle<'n>(
+    nodes: &'n [Node],
+    node_buffer: &mut Vec<Node>,
+    node: &'n Node,
+) -> Option<Cycle> {
+    if node.is_processed() {
+        // Found a cycle
+        let node_cycle_start = node;
+
+        // Delete all the nodes in the cycle buffer before cycle_start.
+        let cycle = Cycle(
+            node_buffer
+                .drain(..)
+                .skip_while(|node| node != node_cycle_start)
+                .collect::<Vec<Node>>(),
+        );
+
+        Some(cycle)
+    } else {
+        node.mark_processed();
+        node_buffer.push(node.clone());
+
+        if node.dependencies.is_empty() {
+            None
+        } else {
+            // Return the first detected cycle.
+            node.dependencies.iter().fold(None, |cycle, dep| {
+                cycle.or_else(|| {
+                    let dep_node = nodes
+                        .iter()
+                        .find(|node| &node.name == &dep.name)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Expected `{}` to have dependency on: `{}`",
+                                &node.name, &dep.name
+                            )
+                        });
+                    detect_cycle(nodes, node_buffer, dep_node)
+                })
+            })
+        }
+    }
+}
+
+fn print_cycles(cycles: HashSet<Cycle>) {
     let node_style = r##"
         node [
             fillcolor = "#bbddff",
@@ -162,19 +225,44 @@ fn _print_graph<'l>(links: &'l HashMap<Node, Vec<Dependency>>) {
     println!("{}", node_style);
     println!("");
 
-    links.iter().for_each(|(node, deps)| {
-        if !node.is_processed() {
-            node.mark_processed();
-            deps.iter()
-                // Only show workspace nodes
-                .filter(|dep| links.keys().any(|node| node.name == dep.name))
-                .for_each(|dep| {
+    cycles.iter().enumerate().for_each(|(index, cycle)| {
+        let nodes = &cycle.0;
+
+        if !nodes.is_empty() {
+            println!("    subgraph cluster_{} {{", index);
+            println!("");
+            println!("        style = dotted;");
+            println!("");
+
+            (0..(nodes.len() - 1)).for_each(|i| {
+                let node = &nodes[i];
+                let neighbour = {
+                    let neighbour_index = if i == nodes.len() - 1 { 0 } else { i + 1 };
+                    &nodes[neighbour_index]
+                };
+
+                let dep = node
+                    .dependencies
+                    .iter()
+                    .find(|dep| &dep.name == &neighbour.name);
+                // .unwrap_or_else(|| {
+                //     panic!(
+                //         "Expected `{}` to have dependency on: `{}`",
+                //         &node.name, &neighbour.name
+                //     )
+                // })
+
+                if let Some(dep) = dep.as_ref() {
                     if dep.dep_type == DependencyType::Dev {
-                        println!("{} -> {}DEV;", &node.name, &dep.name);
+                        println!("{} -> {} [label = <<b>  DEV</b>>];", &node.name, &dep.name);
                     } else {
                         println!("{} -> {};", &node.name, &dep.name);
                     }
-                });
+                }
+            });
+
+            println!("");
+            println!("    }}");
         }
     });
 
@@ -182,118 +270,14 @@ fn _print_graph<'l>(links: &'l HashMap<Node, Vec<Dependency>>) {
     println!("}}");
 }
 
-fn print_cycles<'l>(
-    links: &'l HashMap<Node, Vec<Dependency>>,
-    first_node: Option<&str>,
-    is_subgraph: bool,
-) -> Result<(), ()> {
-    // TODO: while not all links have been visited, attach them to the tree.
-    //
-    // Build a graph. Start at a node:
-    //
-    // 1. Remove the node from links / mark it as seen.
-    // 2. For each of its deps.
-    //
-    //     1. Register the child relationship to the current node.
-    //
-    // 3. For each of its unseen deps.
-    //
-    //     1. Recurse
-
-    let links_iterator = links.iter();
-    if let Some(first_node) = first_node {
-        print_cycles_subgraph(
-            links,
-            links_iterator.skip_while(|(node, _deps)| node.name != first_node),
-            is_subgraph,
-        )
-    } else {
-        print_cycles_subgraph(links, links_iterator, is_subgraph)
-    }
-}
-
-/// Returns true if the node was processed already (cycle detected), false otherwise.
-fn print_cycles_subgraph<'l>(
-    links: &'l HashMap<Node, Vec<Dependency>>,
-    mut links_iterator: impl Iterator<Item = (&'l Node, &'l Vec<Dependency>)>,
-    is_subgraph: bool,
-) -> Result<(), ()> {
-    links_iterator.try_for_each(|(node, deps)| {
-        if !node.is_processed() {
-            node.mark_processed();
-
-            if !is_subgraph {
-                println!("    subgraph cluster_{} {{", &node.name);
-                println!("");
-                println!("        style = dotted;");
-                println!("");
-            }
-
-            let no_cycle = deps
-                .iter()
-                // Only show workspace nodes
-                .filter(|dep| links.keys().any(|node| node.name == dep.name))
-                .try_for_each(|dep| {
-                    if dep.dep_type == DependencyType::Dev {
-                        println!("{} -> {} [label = <<b>  DEV</b>>];", &node.name, &dep.name);
-                    } else {
-                        println!("{} -> {};", &node.name, &dep.name);
-                    }
-
-                    // Recurse
-                    let result = print_cycles(links, Some(&dep.name), true);
-                    if is_subgraph {
-                        result
-                    } else {
-                        // if this is the first level, then just process all deps.
-                        Ok(())
-                    }
-                });
-
-            if !is_subgraph {
-                println!("");
-                println!("    }}");
-            }
-
-            if is_subgraph {
-                no_cycle
-            } else {
-                Ok(())
-            }
-        } else {
-            if is_subgraph {
-                Err(())
-            } else {
-                Ok(())
-            }
-        }
-    })
-}
-
 fn main() -> io::Result<()> {
     let mut all_crates = read_crates("app")?;
     all_crates.extend(read_crates("crate")?);
 
-    let node_style = r##"
-        node [
-            fillcolor = "#bbddff",
-            fontname = "consolas",
-            fontsize = 11,
-            shape = box,
-            style = filled,
-            width = 1.5,
-        ];
-"##;
-    println!("digraph World {{");
-    println!("{}", node_style);
-    println!("");
+    let nodes = build_nodes(all_crates);
+    let cycles = detect_cycles_all(&nodes);
 
-    let links = calculate_links(all_crates);
-
-    let _ = print_cycles(&links, Some("will"), false);
-
-    println!("");
-    println!("}}");
+    print_cycles(cycles);
 
     Ok(())
 }
