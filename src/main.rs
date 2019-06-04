@@ -1,9 +1,9 @@
-use std::{cell::Cell, collections::HashSet, fs, io, path::Path};
+use std::{cell::Cell, cmp::Ordering, collections::HashSet, fs, io, path::Path};
 
 use cargo_toml::Manifest;
 use derivative::Derivative;
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub enum DependencyType {
     Regular,
     Dev,
@@ -16,7 +16,7 @@ pub enum State {
     Processed,
 }
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub struct Dependency {
     /// Name of the crate.
     pub name: String,
@@ -36,12 +36,22 @@ pub struct CrateMetadata {
 #[derivative(Hash, PartialEq, Eq)]
 pub struct Node {
     pub name: String,
-    #[derivative(Hash = "ignore")]
-    #[derivative(PartialEq = "ignore")]
-    pub dependencies: Vec<Dependency>,
-    #[derivative(Hash = "ignore")]
-    #[derivative(PartialEq = "ignore")]
+    #[derivative(Hash = "ignore", PartialEq = "ignore")]
+    pub dependencies: HashSet<Dependency>,
+    #[derivative(Hash = "ignore", PartialEq = "ignore")]
     pub state: Cell<State>,
+}
+
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Node) -> Option<Ordering> {
+        Some(self.name.cmp(&other.name))
+    }
+}
+
+impl Ord for Node {
+    fn cmp(&self, other: &Node) -> Ordering {
+        self.name.cmp(&other.name)
+    }
 }
 
 impl Node {
@@ -55,15 +65,20 @@ impl Node {
 }
 
 /// A cycle is a chain of crates that end up in a dependency circle
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, Eq)]
 pub struct Cycle(pub Vec<Node>);
+
+impl PartialEq for Cycle {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.clone().sort() == other.0.clone().sort()
+    }
+}
 
 fn read_crates<P>(dir: P) -> io::Result<Vec<CrateMetadata>>
 where
     P: AsRef<Path>,
 {
     let dir = dir.as_ref();
-    dbg!(dir);
     let crate_metadatas = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -124,7 +139,7 @@ fn build_nodes(all_crates: Vec<CrateMetadata>) -> Vec<Node> {
             let dependencies = dependencies_regular
                 .chain(dependencies_dev)
                 .filter(|dep| crate_names.iter().any(|name| name == &dep.name))
-                .collect::<Vec<Dependency>>();
+                .collect::<HashSet<Dependency>>();
 
             Node {
                 name,
@@ -139,39 +154,16 @@ fn detect_cycles_all<'l>(nodes: &'l Vec<Node>) -> HashSet<Cycle> {
     // Clone while no nodes are marked processed.
     nodes
         .iter()
-        .flat_map(|node| detect_cycle(&nodes.clone(), &mut Vec::new(), node))
+        .filter_map(|node| detect_cycle(&(nodes.clone()), &mut Vec::new(), node))
         .collect::<HashSet<Cycle>>()
 }
-
-// fn detect_cycles<'node>(nodes: Vec<Node>, first_node: &'node Node) -> HashSet<Cycle> {
-//     let mut cycle_buffer = Vec::new();
-//     let mut target_node = nodes.iter().find(|node| node == first_node);
-
-//     while let Some(node) = target_node {
-//         if !node.is_processed() {
-//             node.mark_processed();
-
-//             node.dependencies.iter()
-
-//             target_node = nodes.iter().find(|node| node == first_node);
-
-//             cycle_buffer.push(node.clone());
-//         } else {
-
-//             return Some(cycle);
-//         }
-//     }
-
-//     // If we reached here, just drop the cycle buffer.
-//     None
-// }
 
 fn detect_cycle<'n>(
     nodes: &'n [Node],
     node_buffer: &mut Vec<Node>,
     node: &'n Node,
 ) -> Option<Cycle> {
-    if node.is_processed() {
+    if node.is_processed() && node_buffer.contains(node) {
         // Found a cycle
         let node_cycle_start = node;
 
@@ -184,6 +176,8 @@ fn detect_cycle<'n>(
         );
 
         Some(cycle)
+    } else if node.dependencies.is_empty() {
+        None
     } else {
         node.mark_processed();
         node_buffer.push(node.clone());
@@ -191,20 +185,23 @@ fn detect_cycle<'n>(
         if node.dependencies.is_empty() {
             None
         } else {
-            // Return the first detected cycle.
+            // Detect the first one.
             node.dependencies.iter().fold(None, |cycle, dep| {
-                cycle.or_else(|| {
-                    let dep_node = nodes
-                        .iter()
-                        .find(|node| &node.name == &dep.name)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Expected `{}` to have dependency on: `{}`",
-                                &node.name, &dep.name
-                            )
-                        });
-                    detect_cycle(nodes, node_buffer, dep_node)
-                })
+                if cycle.is_some() {
+                    return cycle;
+                }
+
+                let dep_node = nodes
+                    .iter()
+                    .find(|node| &node.name == &dep.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Expected `{}` to have dependency on: `{}`",
+                            &node.name, &dep.name
+                        )
+                    });
+
+                detect_cycle(nodes, &mut (node_buffer.clone()), dep_node)
             })
         }
     }
@@ -228,10 +225,21 @@ fn print_cycles(cycles: HashSet<Cycle>) {
     cycles.iter().enumerate().for_each(|(index, cycle)| {
         let nodes = &cycle.0;
 
-        if !nodes.is_empty() {
+        // TODO: Why do we get single node cycles?
+        if nodes.len() >= 2 {
             println!("    subgraph cluster_{} {{", index);
             println!("");
             println!("        style = dotted;");
+            println!("");
+
+            nodes.iter().for_each(|node| {
+                println!(
+                    "        {krate}{index} [label = {krate}];",
+                    krate = &node.name,
+                    index = index
+                );
+            });
+
             println!("");
 
             (0..(nodes.len() - 1)).for_each(|i| {
@@ -250,14 +258,31 @@ fn print_cycles(cycles: HashSet<Cycle>) {
                 //         "Expected `{}` to have dependency on: `{}`",
                 //         &node.name, &neighbour.name
                 //     )
-                // })
+                // });
 
                 if let Some(dep) = dep.as_ref() {
                     if dep.dep_type == DependencyType::Dev {
-                        println!("{} -> {} [label = <<b>  DEV</b>>];", &node.name, &dep.name);
+                        println!(
+                            "{krate}{index} -> {dep}{index} [label = <<b>  DEV</b>>];",
+                            krate = &node.name,
+                            dep = &dep.name,
+                            index = index
+                        );
                     } else {
-                        println!("{} -> {};", &node.name, &dep.name);
+                        println!(
+                            "{krate}{index} -> {dep}{index} [label = <<b>  REG</b>>];",
+                            krate = &node.name,
+                            dep = &dep.name,
+                            index = index
+                        );
                     }
+                } else {
+                    // println!(
+                    //     "{krate}{index} -> {dep}{index};",
+                    //     krate = &node.name,
+                    //     dep = &neighbour.name,
+                    //     index = index
+                    // );
                 }
             });
 
