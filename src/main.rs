@@ -174,12 +174,19 @@ fn detect_cycle<'n>(nodes: &'n [Node], node_buffer: &mut Vec<Node>, node: &'n No
         vec![cycle]
     } else {
         node.mark_processed();
+
+        let filter: fn(&&Dependency) -> bool = if node_buffer.is_empty() {
+            |_dep: &&Dependency| true
+        } else {
+            |dep: &&Dependency| dep.dep_type != DependencyType::Dev
+        };
+
         node_buffer.push(node.clone());
 
         // Detect the first one.
         node.dependencies
             .iter()
-            .filter(|dep| dep.dep_type != DependencyType::Dev)
+            .filter(filter)
             .fold(Vec::new(), |mut cycles, dep| {
                 let dep_node = nodes
                     .iter()
