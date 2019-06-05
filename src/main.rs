@@ -154,43 +154,33 @@ fn detect_cycles_all<'l>(nodes: &'l Vec<Node>) -> HashSet<Cycle> {
     // Clone while no nodes are marked processed.
     nodes
         .iter()
-        .filter_map(|node| detect_cycle(&(nodes.clone()), &mut Vec::new(), node))
+        .flat_map(|node| detect_cycle(&(nodes.clone()), &mut Vec::new(), node))
         .collect::<HashSet<Cycle>>()
 }
 
-fn detect_cycle<'n>(
-    nodes: &'n [Node],
-    node_buffer: &mut Vec<Node>,
-    node: &'n Node,
-) -> Option<Cycle> {
+fn detect_cycle<'n>(nodes: &'n [Node], node_buffer: &mut Vec<Node>, node: &'n Node) -> Vec<Cycle> {
     if node.is_processed() && node_buffer.contains(node) {
         // Found a cycle
-        let node_cycle_start = node;
+        // let node_cycle_start = node;
 
         // Delete all the nodes in the cycle buffer before cycle_start.
         let cycle = Cycle(
             node_buffer
                 .drain(..)
-                .skip_while(|node| node != node_cycle_start)
+                // .skip_while(|node| node != node_cycle_start)
                 .collect::<Vec<Node>>(),
         );
 
-        Some(cycle)
-    } else if node.dependencies.is_empty() {
-        None
+        vec![cycle]
     } else {
         node.mark_processed();
         node_buffer.push(node.clone());
 
-        if node.dependencies.is_empty() {
-            None
-        } else {
-            // Detect the first one.
-            node.dependencies.iter().fold(None, |cycle, dep| {
-                if cycle.is_some() {
-                    return cycle;
-                }
-
+        // Detect the first one.
+        node.dependencies
+            .iter()
+            .filter(|dep| dep.dep_type != DependencyType::Dev)
+            .fold(Vec::new(), |mut cycles, dep| {
                 let dep_node = nodes
                     .iter()
                     .find(|node| &node.name == &dep.name)
@@ -201,9 +191,9 @@ fn detect_cycle<'n>(
                         )
                     });
 
-                detect_cycle(nodes, &mut (node_buffer.clone()), dep_node)
+                cycles.extend(detect_cycle(nodes, &mut (node_buffer.clone()), dep_node));
+                cycles
             })
-        }
     }
 }
 
